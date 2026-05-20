@@ -1560,6 +1560,357 @@ program
     }
 });
 
+// ====================================================================
+// 风格化改写流水线（v0.23.0 新增）
+// 用于「已有整本初稿 → 按目标风格批量重写」场景
+// ====================================================================
+
+// split 命令 - 把整本初稿按章节切分为独立文件
+program
+    .command('split <file>')
+    .description('将整本初稿按章节切分为独立文件')
+    .option('-o, --output-dir <dir>', '输出目录', 'draft/chapters')
+    .option('--pattern <regex>', '章节标题正则（默认匹配 第X章/节/回 与 # Chapter）',
+        '^(第[一二三四五六七八九十百千万零\\d]+[章节回卷篇][\\s\\S]*?$|#{1,3}\\s+(Chapter|第).*$)')
+    .action(async (file, options) => {
+        try {
+            const filePath = path.resolve(file);
+            if (!await fs.pathExists(filePath)) {
+                console.log(chalk.red(`❌ 文件不存在: ${file}`));
+                process.exit(1);
+            }
+            const text = await fs.readFile(filePath, 'utf-8');
+            const lines = text.split(/\r?\n/);
+            const chapterRegex = new RegExp(options.pattern);
+
+            const chapters = [];
+            let current = { title: '前言', lines: [], startLine: 0 };
+
+            for (let i = 0; i < lines.length; i++) {
+                const line = lines[i];
+                if (chapterRegex.test(line.trim())) {
+                    if (current.lines.length > 0 && current.lines.some(l => l.trim())) {
+                        chapters.push(current);
+                    }
+                    current = { title: line.trim(), lines: [line], startLine: i };
+                } else {
+                    current.lines.push(line);
+                }
+            }
+            if (current.lines.length > 0 && current.lines.some(l => l.trim())) {
+                chapters.push(current);
+            }
+
+            if (chapters.length === 0) {
+                console.log(chalk.yellow('⚠️  未识别到任何章节，请检查 --pattern 参数'));
+                console.log(chalk.gray('   示例: --pattern "^第[一二三四五六七八九十\\d]+章"'));
+                process.exit(1);
+            }
+
+            await fs.ensureDir(options.outputDir);
+
+            const index = [];
+            for (let i = 0; i < chapters.length; i++) {
+                const ch = chapters[i];
+                const safeTitle = ch.title
+                    .replace(/^#+\s*/, '')
+                    .replace(/[\\/:*?"<>|]/g, '_')
+                    .slice(0, 40)
+                    .trim();
+                const fname = `${String(i + 1).padStart(3, '0')}-${safeTitle || 'chapter'}.md`;
+                const fpath = path.join(options.outputDir, fname);
+                const content = ch.lines.join('\n');
+                await fs.writeFile(fpath, content, 'utf-8');
+
+                const wordCount = content.replace(/\s/g, '').length;
+                index.push({
+                    index: i + 1,
+                    title: ch.title.replace(/^#+\s*/, '').trim(),
+                    file: fname,
+                    wordCount
+                });
+            }
+
+            const indexPath = path.join(options.outputDir, '_index.json');
+            await fs.writeJson(indexPath, {
+                source: file,
+                pattern: options.pattern,
+                createdAt: new Date().toISOString(),
+                total: chapters.length,
+                totalWords: index.reduce((s, c) => s + c.wordCount, 0),
+                chapters: index
+            }, { spaces: 2 });
+
+            console.log(chalk.green(`✓ 已切分为 ${chapters.length} 章`));
+            console.log(chalk.gray(`  输出目录: ${options.outputDir}`));
+            console.log(chalk.gray(`  索引文件: ${indexPath}`));
+            console.log(chalk.gray(`  总字数:   ${index.reduce((s, c) => s + c.wordCount, 0).toLocaleString()}`));
+            console.log('\n' + chalk.cyan('章节预览（前 10 章）:'));
+            index.slice(0, 10).forEach(ch => {
+                console.log(chalk.gray(`  ${String(ch.index).padStart(3)}. ${ch.title}  (${ch.wordCount} 字)`));
+            });
+            if (index.length > 10) {
+                console.log(chalk.gray(`  ... 还有 ${index.length - 10} 章`));
+            }
+            console.log('\n' + chalk.cyan('下一步:'));
+            console.log(chalk.yellow(`  novel rewrite-batch --source ${options.outputDir} --style nlp/<你的风格>.json`));
+        } catch (error) {
+            console.error(chalk.red('❌ 切分失败:'), error.message);
+            process.exit(1);
+        }
+    });
+
+// rewrite-batch 命令 - 生成批量改写工单
+program
+    .command('rewrite-batch')
+    .description('为整本初稿生成批量改写工单（供 AI 助手执行）')
+    .option('--source <dir>', '初稿章节目录', 'draft/chapters')
+    .option('--style <file>', '目标风格 JSON 文件')
+    .option('--output <dir>', '改写输出目录', 'output/chapters')
+    .option('--protect <file>', '术语/专有名词保护清单（每行一个词）')
+    .option('--threshold <num>', '通过阈值（百分比）', '75')
+    .action(async (options) => {
+        try {
+            if (!options.style) {
+                console.log(chalk.red('❌ 必须通过 --style 指定目标风格 JSON'));
+                console.log(chalk.gray('   先运行: novel analyze <样本文件>  生成风格 JSON'));
+                process.exit(1);
+            }
+            const indexPath = path.join(options.source, '_index.json');
+            if (!await fs.pathExists(indexPath)) {
+                console.log(chalk.red(`❌ 找不到索引文件 ${indexPath}`));
+                console.log(chalk.gray('   请先运行: novel split <初稿文件>'));
+                process.exit(1);
+            }
+            const stylePath = path.resolve(options.style);
+            if (!await fs.pathExists(stylePath)) {
+                console.log(chalk.red(`❌ 风格文件不存在: ${options.style}`));
+                process.exit(1);
+            }
+
+            const index = await fs.readJson(indexPath);
+            await fs.ensureDir(options.output);
+
+            // 读取保护清单
+            let protectedTerms = [];
+            if (options.protect && await fs.pathExists(options.protect)) {
+                const content = await fs.readFile(options.protect, 'utf-8');
+                protectedTerms = content.split(/\r?\n/).map(s => s.trim()).filter(Boolean);
+            }
+
+            const worklist = {
+                version: '1.0',
+                style: path.relative(process.cwd(), stylePath).replace(/\\/g, '/'),
+                sourceDir: options.source.replace(/\\/g, '/'),
+                outputDir: options.output.replace(/\\/g, '/'),
+                threshold: parseInt(options.threshold, 10),
+                protectedTerms,
+                createdAt: new Date().toISOString(),
+                tasks: index.chapters.map(ch => ({
+                    index: ch.index,
+                    title: ch.title,
+                    file: ch.file,
+                    sourcePath: path.join(options.source, ch.file).replace(/\\/g, '/'),
+                    targetPath: path.join(options.output, ch.file).replace(/\\/g, '/'),
+                    originalWords: ch.wordCount,
+                    status: 'pending',
+                    matchScore: null,
+                    attempts: 0,
+                    notes: ''
+                }))
+            };
+
+            const worklistPath = 'rewrite-worklist.json';
+            await fs.writeJson(worklistPath, worklist, { spaces: 2 });
+
+            console.log(chalk.green(`✓ 已生成改写工单: ${worklistPath}`));
+            console.log(chalk.gray(`  目标风格: ${worklist.style}`));
+            console.log(chalk.gray(`  待改写章节: ${worklist.tasks.length}`));
+            console.log(chalk.gray(`  通过阈值: ${worklist.threshold}%`));
+            if (protectedTerms.length > 0) {
+                console.log(chalk.gray(`  保护术语: ${protectedTerms.length} 个`));
+            }
+            console.log('\n' + chalk.cyan('下一步：在 AI 助手中执行改写命令'));
+            console.log(chalk.yellow('  Claude Code:  /novel.rewrite-execute'));
+            console.log(chalk.yellow('  Cursor:       /rewrite-execute'));
+            console.log(chalk.yellow('  Gemini CLI:   /novel:rewrite-execute'));
+            console.log(chalk.gray('\nAI 将按工单逐章改写，自动调用 novel diff-style 校验匹配度'));
+        } catch (error) {
+            console.error(chalk.red('❌ 生成工单失败:'), error.message);
+            process.exit(1);
+        }
+    });
+
+// diff-style 命令 - 对比改写前后的风格变化
+program
+    .command('diff-style <before> <after>')
+    .description('对比改写前后的风格指纹变化')
+    .option('--target <file>', '同时对比与目标风格的距离（风格 JSON）')
+    .option('-o, --output <file>', '输出 JSON 报告')
+    .action(async (before, after, options) => {
+        try {
+            const beforePath = path.resolve(before);
+            const afterPath = path.resolve(after);
+            if (!await fs.pathExists(beforePath)) {
+                console.log(chalk.red(`❌ 文件不存在: ${before}`));
+                process.exit(1);
+            }
+            if (!await fs.pathExists(afterPath)) {
+                console.log(chalk.red(`❌ 文件不存在: ${after}`));
+                process.exit(1);
+            }
+
+            const NLPAnalyzer = (await import('./utils/nlp-analyzer.js')).default;
+            const ConsistencyChecker = (await import('./utils/consistency-checker.js')).default;
+            const analyzer = new NLPAnalyzer();
+            const checker = new ConsistencyChecker();
+
+            const textBefore = await fs.readFile(beforePath, 'utf-8');
+            const textAfter = await fs.readFile(afterPath, 'utf-8');
+            const fpBefore = analyzer.analyze(textBefore);
+            const fpAfter = analyzer.analyze(textAfter);
+
+            console.log(chalk.cyan('\n📊 风格指纹对比\n'));
+            console.log(chalk.yellow('维度                 改写前        改写后        变化'));
+            console.log(chalk.gray('─'.repeat(64)));
+
+            const fmtDelta = (a, b) => {
+                const delta = b - a;
+                const arrow = delta > 0.001 ? chalk.green('↑') :
+                              delta < -0.001 ? chalk.red('↓') : chalk.gray('=');
+                const sign = delta >= 0 ? '+' : '';
+                return `${a.toFixed(3).padStart(10)}    ${b.toFixed(3).padStart(10)}    ${arrow} ${sign}${delta.toFixed(3)}`;
+            };
+
+            console.log(`词汇丰富度 TTR       ${fmtDelta(fpBefore.vocabulary.vocabularyRichness, fpAfter.vocabulary.vocabularyRichness)}`);
+            console.log(`平均句长             ${fmtDelta(fpBefore.syntax.avgSentenceLength, fpAfter.syntax.avgSentenceLength)}`);
+            console.log(`句长标准差           ${fmtDelta(fpBefore.syntax.stdDeviation, fpAfter.syntax.stdDeviation)}`);
+            console.log(`情感得分             ${fmtDelta(fpBefore.sentiment.sentimentScore, fpAfter.sentiment.sentimentScore)}`);
+            console.log(`总词数(规模变化)     ${fmtDelta(fpBefore.vocabulary.totalTokens, fpAfter.vocabulary.totalTokens)}`);
+
+            const sizeChange = (fpAfter.vocabulary.totalTokens - fpBefore.vocabulary.totalTokens) / fpBefore.vocabulary.totalTokens;
+            const sizeWarn = Math.abs(sizeChange) > 0.15
+                ? chalk.red(`  ⚠ 规模变化 ${(sizeChange * 100).toFixed(1)}% 超过 ±15%，可能存在过度删减/膨胀`)
+                : chalk.gray(`  ✓ 规模变化 ${(sizeChange * 100).toFixed(1)}% 在合理范围内`);
+            console.log(sizeWarn);
+
+            const report = {
+                before: { file: before, fingerprint: fpBefore },
+                after:  { file: after, fingerprint: fpAfter },
+                sizeChange
+            };
+
+            if (options.target) {
+                const targetPath = path.resolve(options.target);
+                if (!await fs.pathExists(targetPath)) {
+                    console.log(chalk.red(`\n❌ 目标风格文件不存在: ${options.target}`));
+                    process.exit(1);
+                }
+                const target = await fs.readJson(targetPath);
+                const matchBefore = checker.checkConsistency(textBefore, target);
+                const matchAfter = checker.checkConsistency(textAfter, target);
+
+                console.log(chalk.yellow('\n🎯 与目标风格匹配度\n'));
+                const colorOf = s => s >= 80 ? chalk.green : s >= 60 ? chalk.yellow : chalk.red;
+                console.log(`改写前: ${colorOf(matchBefore.overall)(matchBefore.overall.toFixed(1) + '%')}  (${matchBefore.overallLevel})`);
+                console.log(`改写后: ${colorOf(matchAfter.overall)(matchAfter.overall.toFixed(1) + '%')}  (${matchAfter.overallLevel})`);
+
+                const improvement = matchAfter.overall - matchBefore.overall;
+                let verdict;
+                if (improvement > 5) verdict = chalk.green(`✓ 显著改善 (+${improvement.toFixed(1)}%)`);
+                else if (improvement > 0) verdict = chalk.yellow(`～ 略有提升 (+${improvement.toFixed(1)}%)`);
+                else verdict = chalk.red(`✗ 未达预期 (${improvement.toFixed(1)}%)`);
+                console.log(`变化:   ${verdict}`);
+
+                console.log(chalk.yellow('\n各维度匹配度（改写后）:'));
+                const d = matchAfter.dimensions;
+                console.log(`  词汇: ${(d.vocabulary.score * 100).toFixed(1)}%   句法: ${(d.syntax.score * 100).toFixed(1)}%   情感: ${(d.sentiment.score * 100).toFixed(1)}%   节奏: ${(d.rhythm.score * 100).toFixed(1)}%`);
+
+                report.target = options.target;
+                report.matchBefore = matchBefore;
+                report.matchAfter = matchAfter;
+                report.improvement = improvement;
+
+                // 输出 PASS / FAIL（供 AI 自动判断）
+                const passed = matchAfter.overall >= 75;
+                console.log('\n' + (passed
+                    ? chalk.green.bold('  RESULT: PASS')
+                    : chalk.red.bold('  RESULT: FAIL  ') + chalk.gray('(建议重写或人工介入)')));
+            }
+
+            if (options.output) {
+                await fs.writeJson(options.output, report, { spaces: 2 });
+                console.log(chalk.gray(`\n报告已保存: ${options.output}`));
+            }
+        } catch (error) {
+            console.error(chalk.red('❌ 对比失败:'), error.message);
+            process.exit(1);
+        }
+    });
+
+// compose 命令 - 合并改写后章节为完整书稿
+program
+    .command('compose')
+    .description('合并改写后的章节为完整书稿')
+    .option('--input <dir>', '改写章节目录', 'output/chapters')
+    .option('--output <file>', '输出文件', 'output/final.md')
+    .option('--separator <str>', '章节间分隔符', '\n\n')
+    .action(async (options) => {
+        try {
+            // 索引文件优先从 source（draft/chapters）找，否则从 input 自身找
+            let indexPath = path.join(options.input, '_index.json');
+            if (!await fs.pathExists(indexPath)) {
+                // 尝试从 draft/chapters 找
+                indexPath = path.join('draft', 'chapters', '_index.json');
+                if (!await fs.pathExists(indexPath)) {
+                    console.log(chalk.red(`❌ 找不到索引文件，请确保已运行过 novel split`));
+                    process.exit(1);
+                }
+            }
+
+            const index = await fs.readJson(indexPath);
+            const parts = [];
+            const missing = [];
+
+            for (const ch of index.chapters) {
+                const fpath = path.join(options.input, ch.file);
+                if (await fs.pathExists(fpath)) {
+                    parts.push(await fs.readFile(fpath, 'utf-8'));
+                } else {
+                    missing.push(ch.file);
+                }
+            }
+
+            if (parts.length === 0) {
+                console.log(chalk.red('❌ 没有找到任何改写后的章节文件'));
+                process.exit(1);
+            }
+
+            await fs.ensureDir(path.dirname(options.output));
+            const finalText = parts.join(options.separator);
+            await fs.writeFile(options.output, finalText, 'utf-8');
+
+            const finalWords = finalText.replace(/\s/g, '').length;
+
+            console.log(chalk.green(`✓ 合稿完成: ${options.output}`));
+            console.log(chalk.gray(`  合并章节: ${parts.length}/${index.chapters.length}`));
+            console.log(chalk.gray(`  总字数:   ${finalWords.toLocaleString()}`));
+            console.log(chalk.gray(`  原书字数: ${(index.totalWords || 0).toLocaleString()}`));
+
+            if (missing.length > 0) {
+                console.log(chalk.yellow(`\n⚠️  缺失 ${missing.length} 章未改写:`));
+                missing.slice(0, 10).forEach(f => console.log(chalk.gray(`     - ${f}`)));
+                if (missing.length > 10) console.log(chalk.gray(`     ... 还有 ${missing.length - 10} 章`));
+            }
+
+            console.log('\n' + chalk.cyan('下一步：'));
+            console.log(chalk.yellow(`  novel check-style ${options.output} <目标风格.json>   # 全书风格校验`));
+        } catch (error) {
+            console.error(chalk.red('❌ 合稿失败:'), error.message);
+            process.exit(1);
+        }
+    });
+
 // 自定义帮助信息
 program.on('--help', () => {
     console.log('');
@@ -1588,6 +1939,12 @@ program.on('--help', () => {
     console.log('  novel preprocess <file>     - 预处理样本文本');
     console.log('  novel analyze <file>        - NLP 文本分析');
     console.log('  novel check-style <f> <s>   - 风格一致性检测');
+    console.log('');
+    console.log(chalk.cyan('风格化改写流水线 (v0.23.0+):'));
+    console.log('  novel split <file>             - 将整本初稿按章节切分');
+    console.log('  novel rewrite-batch --style    - 生成批量改写工单');
+    console.log('  novel diff-style <a> <b>       - 对比改写前后风格变化');
+    console.log('  novel compose --output         - 合并改写后章节为成稿');
     console.log('');
     console.log(chalk.gray('更多信息: https://github.com/wordflowlab/novel-writer'));
 });

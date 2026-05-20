@@ -170,13 +170,19 @@ export class PluginManager {
 
         // AI 平台配置
         const AI_COMMAND_DIRS = {
-            'claude': { dir: '.claude/commands', prefix: 'novel.', needsFrontmatter: true },
-            'cursor': { dir: '.cursor/commands', prefix: '', needsFrontmatter: false },
-            'gemini': { dir: '.gemini/commands/novel', prefix: '', needsFrontmatter: false, toml: true },
-            'windsurf': { dir: '.windsurf/workflows', prefix: '', needsFrontmatter: false },
-            'roocode': { dir: '.roo/commands', prefix: '', needsFrontmatter: false },
-            'copilot': { dir: '.github/prompts', prefix: '', needsFrontmatter: false },
-            'qwen': { dir: '.qwen/commands', prefix: '', needsFrontmatter: false, toml: true },
+            'claude':    { dir: '.claude/commands',       prefix: 'novel.', needsFrontmatter: true  },
+            'cursor':    { dir: '.cursor/commands',       prefix: '',       needsFrontmatter: false },
+            'gemini':    { dir: '.gemini/commands/novel', prefix: '',       needsFrontmatter: false, toml: true },
+            'windsurf':  { dir: '.windsurf/workflows',    prefix: '',       needsFrontmatter: false },
+            'roocode':   { dir: '.roo/commands',          prefix: '',       needsFrontmatter: false },
+            'copilot':   { dir: '.github/prompts',        prefix: '',       needsFrontmatter: false },
+            'qwen':      { dir: '.qwen/commands',         prefix: '',       needsFrontmatter: false, toml: true },
+            'codex':     { dir: '.codex/prompts',         prefix: 'novel-', needsFrontmatter: false },
+            'opencode':  { dir: '.opencode/command',      prefix: '',       needsFrontmatter: false },
+            'kilocode':  { dir: '.kilocode/workflows',    prefix: '',       needsFrontmatter: false },
+            'auggie':    { dir: '.augment/commands',      prefix: '',       needsFrontmatter: false },
+            'codebuddy': { dir: '.codebuddy/commands',    prefix: '',       needsFrontmatter: false },
+            'q':         { dir: '.amazonq/prompts',       prefix: '',       needsFrontmatter: false },
         };
 
         let injectedCount = 0;
@@ -316,13 +322,19 @@ ${escapedContent}
         }
 
         const aiDirs = {
-            'claude': '.claude',
-            'cursor': '.cursor',
-            'gemini': '.gemini',
-            'windsurf': '.windsurf',
-            'roocode': '.roo',
-            'copilot': '.github',
-            'qwen': '.qwen',
+            'claude':    '.claude',
+            'cursor':    '.cursor',
+            'gemini':    '.gemini',
+            'windsurf':  '.windsurf',
+            'roocode':   '.roo',
+            'copilot':   '.github',
+            'qwen':      '.qwen',
+            'codex':     '.codex',
+            'opencode':  '.opencode',
+            'kilocode':  '.kilocode',
+            'auggie':    '.augment',
+            'codebuddy': '.codebuddy',
+            'q':         '.amazonq',
         };
 
         const installedAIs = [];

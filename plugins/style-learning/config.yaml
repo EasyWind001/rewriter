@@ -184,6 +184,25 @@ commands:
     examples:
       - "/style-similarity content/chapter-01.md samples/reference.txt"
 
+  # ========== 风格化改写流水线 (v0.23.0+) ==========
+  # 适用场景：已有整本初稿，按目标风格批量重写
+  rewrite-execute:
+    description: "批量风格化改写 - 按工单逐章改写整本初稿"
+    usage: "/rewrite-execute"
+    parameters:
+      - name: "工单文件"
+        required: false
+        default: "rewrite-worklist.json"
+        description: "改写工单（由 novel rewrite-batch 生成）"
+    examples:
+      - "/rewrite-execute"
+    workflow:
+      - "novel split <初稿文件>           # 切分章节"
+      - "novel analyze <样本文件>         # 学习目标风格"
+      - "novel rewrite-batch --style ...  # 生成工单"
+      - "/rewrite-execute                 # AI 批量改写"
+      - "novel compose                    # 合并成稿"
+
 # 专家模式
 experts:
   style-expert:

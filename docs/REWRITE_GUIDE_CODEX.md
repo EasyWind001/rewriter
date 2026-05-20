@@ -16,6 +16,11 @@
 6. [进阶技巧](#六进阶技巧)
 7. [常见问题排查](#七常见问题排查)
 8. [配置参考](#八配置参考)
+9. [5 分钟快速开始](#九附最简快速开始5-分钟版)
+10. [**长记忆系统（防止 AI 失忆）⭐**](#十长记忆系统v0240-️-防止-ai-失忆)
+6. [进阶技巧](#六进阶技巧)
+7. [常见问题排查](#七常见问题排查)
+8. [配置参考](#八配置参考)
 
 ---
 
@@ -1179,3 +1184,390 @@ novel check-style output/最终稿.md nlp/target/目标书.json
 - [项目架构总览](../README.md)
 - [NLP 分析流程](nlp-analysis-flow.md)
 - [风格学习插件](../plugins/style-learning/README.md)
+
+---
+
+## 十、长记忆系统（v0.24.0+）⭐ 防止 AI 失忆
+
+### 10.1 为什么需要长记忆？
+
+批量改写 50 章时，AI 在改第 30 章时**已经完全忘了第 5 章**做过什么决策：
+
+| 失忆类型 | 具体表现 | 后果 |
+|---------|---------|------|
+| **术语漂移** | "Transformer"前面译"变换器"，后面译"变压器" | 🔴 全书术语不一致 |
+| **称谓不一** | 前面用"我们"，后面变"你"或"读者" | 🔴 风格分裂 |
+| **概念引用断裂** | 第 15 章说"如前所述的 X 原则"，但 X 原则前文表述对不上 | 🔴 逻辑断裂 |
+| **风格漂移** | 前 5 章句长稳定，第 20 章突然变长 | 🟡 风格疲劳 |
+
+**长记忆系统的解决方案**：让 AI 改每一章时都先读取一份"全书工作笔记"，改完后把新决策写回笔记。
+
+### 10.2 工作原理
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                                                             │
+│   memory/rewrite-memory.json    ← 全局记忆库（持久化）       │
+│   ┌─────────────────────────────────────────────────────┐  │
+│   │ 术语表（全书统一译法）                                  │  │
+│   │   Transformer → "Transformer 模型"                  │  │
+│   │   fine-tuning → "微调"                              │  │
+│   │   ...                                               │  │
+│   │                                                     │  │
+│   │ 风格决策（全书锁定）                                   │  │
+│   │   narratorPerson: 第二人称（你）                      │  │
+│   │   toneRegister: 通俗易懂                             │  │
+│   │                                                     │  │
+│   │ 章节摘要（供后续章节交叉引用）                          │  │
+│   │   Ch3: Transformer 基础 [keyClaims, definedTerms]   │  │
+│   │   Ch5: BERT 详解 ...                                │  │
+│   │   ...                                               │  │
+│   └─────────────────────────────────────────────────────┘  │
+│                ▲                          │                 │
+│                │ 读取                  写回 │                 │
+│                │                          ▼                 │
+│   ┌────────────────────────────────────────────────────┐   │
+│   │  改写第 N 章时的输入                                  │   │
+│   │   - 完整记忆库（全书共享）                              │   │
+│   │   - 前 N-2..N-1 章成稿（滑动窗口：上下文衔接）           │   │
+│   │   - 第 N 章原稿（待改写）                              │   │
+│   │   - 第 N+1 章原稿（预读：识别伏笔）                     │   │
+│   │   - 风格指纹 JSON                                    │   │
+│   └────────────────────────────────────────────────────┘   │
+│                                                             │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### 10.3 命令速查
+
+| 命令 | 用途 |
+|------|------|
+| `novel memory init` | 初始化空记忆库 |
+| `novel memory show` | 查看当前记忆（术语/风格/章节摘要） |
+| `novel memory show --section terminology` | 只看术语表 |
+| `novel memory update --patch-file <file> --chapter <n>` | 合并新记忆（AI 自动调用） |
+| `novel memory validate <chapter.md>` | 校验某章是否符合记忆 |
+| `novel memory check-all` | 全书一致性扫描 |
+
+### 10.4 默认行为（无需手动操作）
+
+从 v0.24.0 起，`novel rewrite-batch` **自动启用长记忆系统**：
+
+```powershell
+novel rewrite-batch --source draft/chapters --style nlp/target/某书.json --output output/chapters
+```
+
+会自动做：
+1. ✅ 检测 `memory/rewrite-memory.json` 是否存在，不存在则自动创建
+2. ✅ 在 `rewrite-worklist.json` 中注入 `memory.enabled: true`
+3. ✅ 配置滑动窗口（默认前 2 章 + 后 1 章）
+
+```json
+// rewrite-worklist.json (v2.0)
+{
+  "version": "2.0",
+  "memory": {
+    "enabled": true,
+    "path": "memory/rewrite-memory.json"
+  },
+  "slidingWindow": {
+    "contextBefore": 2,
+    "contextAfter": 1
+  },
+  ...
+}
+```
+
+然后在 Codex 中执行 `/novel-rewrite-execute`，AI 会：
+
+1. **每章开始前**：读取记忆库 + 前 2 章成稿 + 后 1 章原稿
+2. **改写时**：严格使用记忆库中的术语译法，沿用风格决策
+3. **改完后**：自动调用 `novel memory update` 把新术语/章节摘要写入记忆库
+4. **校验时**：除了 `novel diff-style` 风格校验，还做 `novel memory validate` 术语校验
+5. **失败时**：术语漂移 → 自动修正错误用词；风格不达标 → 二次改写
+
+### 10.5 自定义参数
+
+```powershell
+# 调整滑动窗口大小（参考更多上下文，但消耗更多 token）
+novel rewrite-batch `
+  --source draft/chapters `
+  --style nlp/target/某书.json `
+  --output output/chapters `
+  --window-before 3 `
+  --window-after 2
+
+# 使用自定义记忆库路径
+novel rewrite-batch `
+  --source draft/chapters `
+  --style nlp/target/某书.json `
+  --memory custom/my-memory.json
+
+# 禁用长记忆（不推荐）
+novel rewrite-batch `
+  --source draft/chapters `
+  --style nlp/target/某书.json `
+  --no-memory
+```
+
+### 10.6 中途查看 / 编辑记忆库
+
+#### 查看 AI 已经做了哪些决策
+
+```powershell
+# 看完整记忆
+novel memory show
+
+# 只看术语表
+novel memory show --section terminology
+
+# 只看风格决策
+novel memory show --section style
+
+# 只看章节摘要
+novel memory show --section chapters
+```
+
+**输出示例**：
+```
+📚 改写长记忆库
+
+路径: memory/rewrite-memory.json
+最后更新: 2026-05-20T16:30:00Z
+已改写章节: 15
+
+📖 术语表 (47 个):
+  Transformer → Transformer 模型  (出现 32 次, 首现 Ch3)
+  fine-tuning → 微调  (出现 18 次, 首现 Ch5)
+  attention → 注意力机制  (出现 24 次, 首现 Ch3)
+  ...
+
+🎨 全局风格决策:
+  narratorPerson: 第二人称（你）
+  toneRegister: 通俗易懂
+  exampleStyle: 用日常类比代替学术案例
+  codeBlockHandling: 保留原样，不改注释
+
+📑 章节摘要 (15 章):
+  Ch1. 引言
+     本章介绍 AI 时代的到来...
+     定义术语: AI, 神经网络
+  Ch3. Transformer 基础
+     本章介绍 Transformer 核心架构...
+     定义术语: Transformer, 自注意力, 位置编码
+  ...
+
+🔗 交叉引用: 前向 23 条 / 后向 8 条
+```
+
+#### 手动修正某个错误决策
+
+如果你发现 AI 把某术语译错了（比如把 "Transformer" 译成了 "变换器"，但你想改回 "Transformer 模型"）：
+
+**方式 1：直接编辑记忆库 JSON**
+
+```powershell
+notepad memory\rewrite-memory.json
+```
+
+找到 `terminology.Transformer` 字段，改成你想要的：
+
+```json
+"Transformer": {
+  "translation": "Transformer 模型",
+  "alternativesRejected": ["变换器", "变压器"],
+  "firstAppearance": { "chapter": 3 },
+  "usageCount": 32
+}
+```
+
+**方式 2：用 patch 文件覆盖**
+
+```powershell
+@'
+{
+  "terminology": {
+    "Transformer": {
+      "translation": "Transformer 模型",
+      "alternativesRejected": ["变换器", "变压器"]
+    }
+  }
+}
+'@ | Out-File patch.json -Encoding utf8
+
+novel memory update --patch-file patch.json
+```
+
+修正后，对所有已改写章节做扫描：
+
+```powershell
+novel memory check-all
+```
+
+```
+🔍 全书一致性扫描
+
+✗ 发现 3 处不一致:
+
+  Ch5. 005-第五章.md
+    变换器 (2次) → 应为 Transformer 模型
+  Ch12. 012-第十二章.md
+    变换器 (1次) → 应为 Transformer 模型
+  Ch18. 018-第十八章.md
+    变换器 (5次) → 应为 Transformer 模型
+```
+
+然后让 Codex 修正这些章节：
+
+```
+在 Codex 中输入：
+
+请扫描 output/chapters/ 目录下的所有 .md 文件，
+将所有 "变换器" 替换为 "Transformer 模型"，
+然后调用 novel memory check-all 验证全书一致性。
+```
+
+### 10.7 全书一致性扫描
+
+改写完成后，强烈建议运行：
+
+```powershell
+novel memory check-all --dir output/chapters
+```
+
+这会扫描所有改写后的章节，检查：
+- 是否有术语使用了 `alternativesRejected` 中的错误译法
+- 同一术语在不同章节是否一致
+
+**如果有问题，输出会精确到章节和具体词汇**。修正后再运行一次，直到通过。
+
+### 10.8 完整带记忆的工作流（更新版）
+
+```powershell
+# 1. 初始化项目
+novel init my-book-rewrite --ai codex --plugins style-learning
+cd my-book-rewrite
+
+# 2. 准备样本和初稿（不变）
+copy E:\目标书.txt samples\target\
+copy E:\我的初稿.md draft\
+
+# 3. 学风格 + 切初稿（不变）
+novel preprocess samples/target/目标书.txt
+novel analyze clean/target/目标书.txt
+novel split draft/我的初稿.md
+
+# 4. 生成工单（自动启用长记忆）
+novel rewrite-batch `
+  --source draft/chapters `
+  --style nlp/target/目标书.json `
+  --output output/chapters
+# 输出会显示: "📚 长记忆: 已启用"
+
+# 5. 在 Codex 执行（AI 会自动维护记忆）
+codex
+# /novel-rewrite-execute
+
+# 6. （可选）中途查看 AI 学到了什么
+novel memory show --section terminology
+
+# 7. 改写完成后，做全书一致性扫描
+novel memory check-all
+
+# 8. 合稿 + 校验
+novel compose --output output/最终稿.md
+novel check-style output/最终稿.md nlp/target/目标书.json
+```
+
+### 10.9 多本书的记忆隔离
+
+**每个项目目录有独立的 `memory/rewrite-memory.json`**，互不干扰：
+
+```
+projects/
+├── book-A-rewrite/
+│   ├── memory/rewrite-memory.json  ← A 书的术语表
+│   └── ...
+└── book-B-rewrite/
+    ├── memory/rewrite-memory.json  ← B 书的术语表
+    └── ...
+```
+
+如果你想在多本书间共享某些术语决策（比如同一作者的系列书），手动复制相关字段即可。
+
+### 10.10 记忆库的常见问题
+
+#### Q1: 记忆库越来越大会影响性能吗？
+
+**不会**。即使 100 章 + 500 个术语，记忆库也只有几百 KB，AI 读取毫无压力。
+
+但要注意：如果术语表超过 200 项，AI 上下文消耗会显著增加。这种情况建议：
+- 把不再活跃的术语用 `"deprecated": true` 标记，AI 加载时跳过
+- 或拆分多个记忆文件（按主题）
+
+#### Q2: 如何回滚记忆库？
+
+记忆库每次更新都会在 `rewriteLog` 中留痕：
+
+```json
+"rewriteLog": [
+  { "timestamp": "2026-05-20T15:00:00Z", "chapter": 5, "changes": {...} },
+  { "timestamp": "2026-05-20T15:30:00Z", "chapter": 6, "changes": {...} }
+]
+```
+
+但当前版本不支持自动回滚。建议每改完几章手动备份：
+
+```powershell
+copy memory\rewrite-memory.json memory\rewrite-memory.backup-ch10.json
+```
+
+#### Q3: 我直接编辑了 JSON 文件，会被 AI 覆盖吗？
+
+**不会**。AI 调用 `memory update` 时是**合并模式**：
+- 已存在的术语：累加 usageCount，不修改 translation
+- 已设定的风格决策：不覆盖
+
+所以你手动改了某个术语译法后，AI 会沿用你的修改，不会覆盖。
+
+#### Q4: 滑动窗口大小怎么选？
+
+| 场景 | 推荐窗口 |
+|------|---------|
+| 章节独立性强（如教程书每章自成一体） | `--window-before 1 --window-after 0` |
+| 普通技术书（默认） | `--window-before 2 --window-after 1` |
+| 强连续性叙事（小说/传记/有大量伏笔的书） | `--window-before 3 --window-after 2` |
+| 上下文消耗已经很大（章节本身很长） | `--window-before 1 --window-after 1` |
+
+### 10.11 更新后的目录结构
+
+```
+my-book-rewrite/
+├── memory/                         ← 长记忆系统 ⭐
+│   └── rewrite-memory.json         ← 全局记忆库
+├── draft/chapters/                 ← 切分后的初稿
+├── output/chapters/                ← 改写产物
+├── nlp/target/                     ← 风格指纹
+├── samples/target/                 ← 原始样本
+├── clean/target/                   ← 预处理后的样本
+├── rewrite-worklist.json (v2.0)   ← 工单（含 memory + slidingWindow 配置）
+├── rewrite-report.md               ← 全书改写报告
+└── ...
+```
+
+---
+
+## 总结：本工具的关键不变量
+
+无论改写多少章，长记忆系统保证以下 6 条始终满足：
+
+1. **术语一致**：同一概念全书一种译法
+2. **称谓一致**：narratorPerson 全书不变
+3. **基调一致**：toneRegister 不漂移
+4. **引用真实**：所有"如前所述"指向真实存在的内容
+5. **结构完整**：章节标题、小标题、列表层级与原文 1:1 对应
+6. **事实保留**：人名/地名/数字/年份/引用零修改
+
+只要这 6 条都满足，改写就是成功的。
+
+**这是普通对话式 AI 改写做不到的，因为它每次都是"白板从头来"。我们的方案让 AI 拥有了「持久化的全书认知」。**

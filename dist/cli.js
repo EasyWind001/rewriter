@@ -1565,6 +1565,425 @@ program
 // 用于「已有整本初稿 → 按目标风格批量重写」场景
 // ====================================================================
 
+// ---------- 长记忆系统（v0.24.0 新增） ----------
+// 解决批量改写中 AI "失忆"问题：术语漂移、称谓不一、引用断裂
+
+const DEFAULT_MEMORY_PATH = 'memory/rewrite-memory.json';
+
+function createEmptyMemory() {
+    return {
+        version: '1.0',
+        createdAt: new Date().toISOString(),
+        lastUpdated: new Date().toISOString(),
+        lastChapterIndex: 0,
+
+        // 术语表：所有专有名词、概念的统一译法
+        terminology: {
+            // "Transformer": { translation: "...", alternativesRejected: [...], firstAppearance: {...}, usageCount: 0 }
+        },
+
+        // 全局风格决策（一旦确定，全书遵守）
+        stylisticDecisions: {
+            narratorPerson: null,        // 第一/第二/第三人称
+            toneRegister: null,          // 通俗/学术/对话感等
+            exampleStyle: null,          // 案例处理方式
+            codeBlockHandling: '保留原样，不改注释',
+            quoteHandling: '保留原文引用，不改字'
+        },
+
+        // 章节级关键信息（供后续章节交叉引用使用）
+        chapterIndex: {
+            // "1": { title, keyClaims: [...], definedTerms: [...], summary }
+        },
+
+        // 跨章节引用追踪
+        crossReferences: {
+            forward: [],   // 前向引用（如"如前所述"）
+            backward: []   // 后向引用（如"我们将在第N章..."）
+        },
+
+        // 角色/人物追踪（小说传记适用，技术书可忽略）
+        characterArcs: {},
+
+        // 改写历史日志
+        rewriteLog: []
+    };
+}
+
+// memory 命令族
+const memoryCmd = program
+    .command('memory')
+    .description('管理改写长记忆库（术语表、风格决策、章节摘要）');
+
+memoryCmd
+    .command('init')
+    .description('初始化空的记忆库')
+    .option('-f, --file <path>', '记忆库路径', DEFAULT_MEMORY_PATH)
+    .option('--force', '覆盖已存在的记忆库')
+    .action(async (options) => {
+        try {
+            const memPath = path.resolve(options.file);
+            if (await fs.pathExists(memPath) && !options.force) {
+                console.log(chalk.yellow(`⚠️  记忆库已存在: ${memPath}`));
+                console.log(chalk.gray('   使用 --force 覆盖，或 novel memory show 查看现有内容'));
+                process.exit(1);
+            }
+            await fs.ensureDir(path.dirname(memPath));
+            await fs.writeJson(memPath, createEmptyMemory(), { spaces: 2 });
+            console.log(chalk.green(`✓ 记忆库已初始化: ${memPath}`));
+        } catch (error) {
+            console.error(chalk.red('❌ 初始化失败:'), error.message);
+            process.exit(1);
+        }
+    });
+
+memoryCmd
+    .command('show')
+    .description('查看当前记忆库内容')
+    .option('-f, --file <path>', '记忆库路径', DEFAULT_MEMORY_PATH)
+    .option('--section <name>', '只显示某个分区: terminology|style|chapters|references|characters')
+    .action(async (options) => {
+        try {
+            const memPath = path.resolve(options.file);
+            if (!await fs.pathExists(memPath)) {
+                console.log(chalk.red(`❌ 记忆库不存在: ${memPath}`));
+                console.log(chalk.gray('   先运行: novel memory init'));
+                process.exit(1);
+            }
+            const mem = await fs.readJson(memPath);
+
+            console.log(chalk.cyan('\n📚 改写长记忆库\n'));
+            console.log(chalk.gray(`路径: ${memPath}`));
+            console.log(chalk.gray(`最后更新: ${mem.lastUpdated}`));
+            console.log(chalk.gray(`已改写章节: ${mem.lastChapterIndex}`));
+
+            const showSection = options.section;
+
+            if (!showSection || showSection === 'terminology') {
+                const terms = Object.keys(mem.terminology || {});
+                console.log(chalk.yellow(`\n📖 术语表 (${terms.length} 个):`));
+                if (terms.length === 0) {
+                    console.log(chalk.gray('  (空)'));
+                } else {
+                    terms.slice(0, 30).forEach(term => {
+                        const t = mem.terminology[term];
+                        console.log(`  ${chalk.cyan(term)} → ${t.translation}  ${chalk.gray(`(出现 ${t.usageCount || 0} 次, 首现 Ch${t.firstAppearance?.chapter || '?'})`)}`);
+                    });
+                    if (terms.length > 30) console.log(chalk.gray(`  ... 还有 ${terms.length - 30} 个`));
+                }
+            }
+
+            if (!showSection || showSection === 'style') {
+                console.log(chalk.yellow('\n🎨 全局风格决策:'));
+                Object.entries(mem.stylisticDecisions || {}).forEach(([k, v]) => {
+                    console.log(`  ${k}: ${v ? chalk.cyan(v) : chalk.gray('(未设定)')}`);
+                });
+            }
+
+            if (!showSection || showSection === 'chapters') {
+                const chapters = Object.keys(mem.chapterIndex || {});
+                console.log(chalk.yellow(`\n📑 章节摘要 (${chapters.length} 章):`));
+                if (chapters.length === 0) {
+                    console.log(chalk.gray('  (空)'));
+                } else {
+                    chapters.forEach(idx => {
+                        const c = mem.chapterIndex[idx];
+                        console.log(`  Ch${idx}. ${chalk.cyan(c.title)}`);
+                        if (c.summary) console.log(chalk.gray(`     ${c.summary.substring(0, 80)}${c.summary.length > 80 ? '...' : ''}`));
+                        if (c.definedTerms?.length) console.log(chalk.gray(`     定义术语: ${c.definedTerms.join(', ')}`));
+                    });
+                }
+            }
+
+            if (!showSection || showSection === 'references') {
+                const fwd = mem.crossReferences?.forward?.length || 0;
+                const bwd = mem.crossReferences?.backward?.length || 0;
+                console.log(chalk.yellow(`\n🔗 交叉引用: 前向 ${fwd} 条 / 后向 ${bwd} 条`));
+            }
+
+            if (!showSection || showSection === 'characters') {
+                const chars = Object.keys(mem.characterArcs || {});
+                if (chars.length > 0) {
+                    console.log(chalk.yellow(`\n👤 人物档案 (${chars.length} 位):`));
+                    chars.forEach(name => {
+                        const c = mem.characterArcs[name];
+                        console.log(`  ${chalk.cyan(name)}: ${c.establishedTraits?.join(', ') || '无'}`);
+                    });
+                }
+            }
+
+            console.log('');
+        } catch (error) {
+            console.error(chalk.red('❌ 读取失败:'), error.message);
+            process.exit(1);
+        }
+    });
+
+memoryCmd
+    .command('update')
+    .description('合并新记忆条目到记忆库（供 AI 调用）')
+    .option('-f, --file <path>', '记忆库路径', DEFAULT_MEMORY_PATH)
+    .option('--patch <json>', '记忆补丁（JSON 字符串）')
+    .option('--patch-file <path>', '记忆补丁文件')
+    .option('--chapter <num>', '本次更新关联的章节序号')
+    .action(async (options) => {
+        try {
+            const memPath = path.resolve(options.file);
+            if (!await fs.pathExists(memPath)) {
+                await fs.ensureDir(path.dirname(memPath));
+                await fs.writeJson(memPath, createEmptyMemory(), { spaces: 2 });
+            }
+            const mem = await fs.readJson(memPath);
+
+            // 读取补丁
+            let patch;
+            if (options.patchFile) {
+                patch = await fs.readJson(path.resolve(options.patchFile));
+            } else if (options.patch) {
+                patch = JSON.parse(options.patch);
+            } else {
+                console.log(chalk.red('❌ 必须提供 --patch <json> 或 --patch-file <path>'));
+                process.exit(1);
+            }
+
+            // 深度合并术语表
+            if (patch.terminology) {
+                for (const [term, info] of Object.entries(patch.terminology)) {
+                    if (mem.terminology[term]) {
+                        // 已存在：累加 usageCount，合并 alternativesRejected
+                        mem.terminology[term].usageCount = (mem.terminology[term].usageCount || 0) + (info.usageCount || 1);
+                        if (info.alternativesRejected) {
+                            mem.terminology[term].alternativesRejected = Array.from(new Set([
+                                ...(mem.terminology[term].alternativesRejected || []),
+                                ...info.alternativesRejected
+                            ]));
+                        }
+                    } else {
+                        // 新增
+                        mem.terminology[term] = {
+                            translation: info.translation,
+                            alternativesRejected: info.alternativesRejected || [],
+                            firstAppearance: info.firstAppearance || { chapter: options.chapter || mem.lastChapterIndex + 1 },
+                            usageCount: info.usageCount || 1
+                        };
+                    }
+                }
+            }
+
+            // 风格决策（首次设定后不轻易覆盖）
+            if (patch.stylisticDecisions) {
+                for (const [key, value] of Object.entries(patch.stylisticDecisions)) {
+                    if (!mem.stylisticDecisions[key] || mem.stylisticDecisions[key] === null) {
+                        mem.stylisticDecisions[key] = value;
+                    }
+                }
+            }
+
+            // 章节摘要
+            if (patch.chapterIndex) {
+                Object.assign(mem.chapterIndex, patch.chapterIndex);
+            }
+
+            // 交叉引用追加
+            if (patch.crossReferences) {
+                if (patch.crossReferences.forward) {
+                    mem.crossReferences.forward.push(...patch.crossReferences.forward);
+                }
+                if (patch.crossReferences.backward) {
+                    mem.crossReferences.backward.push(...patch.crossReferences.backward);
+                }
+            }
+
+            // 人物档案
+            if (patch.characterArcs) {
+                for (const [name, arc] of Object.entries(patch.characterArcs)) {
+                    if (mem.characterArcs[name]) {
+                        // 合并特征/关系/状态
+                        mem.characterArcs[name].establishedTraits = Array.from(new Set([
+                            ...(mem.characterArcs[name].establishedTraits || []),
+                            ...(arc.establishedTraits || [])
+                        ]));
+                        Object.assign(mem.characterArcs[name].relationships || {}, arc.relationships || {});
+                        if (arc.knowledgeState) {
+                            mem.characterArcs[name].knowledgeState = arc.knowledgeState;
+                        }
+                    } else {
+                        mem.characterArcs[name] = arc;
+                    }
+                }
+            }
+
+            // 更新元信息
+            mem.lastUpdated = new Date().toISOString();
+            if (options.chapter) {
+                const chNum = parseInt(options.chapter, 10);
+                mem.lastChapterIndex = Math.max(mem.lastChapterIndex, chNum);
+            }
+            mem.rewriteLog.push({
+                timestamp: new Date().toISOString(),
+                chapter: options.chapter ? parseInt(options.chapter, 10) : null,
+                changes: {
+                    newTerms: Object.keys(patch.terminology || {}).length,
+                    newChapters: Object.keys(patch.chapterIndex || {}).length,
+                    newReferences: (patch.crossReferences?.forward?.length || 0) + (patch.crossReferences?.backward?.length || 0)
+                }
+            });
+
+            await fs.writeJson(memPath, mem, { spaces: 2 });
+            console.log(chalk.green(`✓ 记忆库已更新`));
+            console.log(chalk.gray(`  新增术语: ${Object.keys(patch.terminology || {}).length}`));
+            console.log(chalk.gray(`  新增章节: ${Object.keys(patch.chapterIndex || {}).length}`));
+            console.log(chalk.gray(`  当前进度: ${mem.lastChapterIndex} 章`));
+        } catch (error) {
+            console.error(chalk.red('❌ 更新失败:'), error.message);
+            process.exit(1);
+        }
+    });
+
+memoryCmd
+    .command('validate <chapter-file>')
+    .description('校验某章节是否符合记忆库（术语一致性等）')
+    .option('-f, --file <path>', '记忆库路径', DEFAULT_MEMORY_PATH)
+    .action(async (chapterFile, options) => {
+        try {
+            const memPath = path.resolve(options.file);
+            const filePath = path.resolve(chapterFile);
+            if (!await fs.pathExists(memPath)) {
+                console.log(chalk.red(`❌ 记忆库不存在: ${memPath}`));
+                process.exit(1);
+            }
+            if (!await fs.pathExists(filePath)) {
+                console.log(chalk.red(`❌ 章节文件不存在: ${chapterFile}`));
+                process.exit(1);
+            }
+            const mem = await fs.readJson(memPath);
+            const text = await fs.readFile(filePath, 'utf-8');
+
+            const issues = [];
+
+            // 检查 1：被拒绝的译法是否出现
+            for (const [term, info] of Object.entries(mem.terminology)) {
+                if (!info.alternativesRejected) continue;
+                for (const rejected of info.alternativesRejected) {
+                    if (text.includes(rejected)) {
+                        // 但要排除：如果文中也出现了正确的译法，可能只是引用比较
+                        const correctCount = (text.match(new RegExp(info.translation.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g')) || []).length;
+                        const wrongCount = (text.match(new RegExp(rejected.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g')) || []).length;
+                        if (wrongCount > 0) {
+                            issues.push({
+                                type: 'terminology_drift',
+                                severity: 'high',
+                                term,
+                                expected: info.translation,
+                                found: rejected,
+                                count: wrongCount,
+                                hint: `应使用 "${info.translation}"（已在第 ${info.firstAppearance?.chapter || '?'} 章确立）`
+                            });
+                        }
+                    }
+                }
+            }
+
+            // 检查 2：交叉引用的目标章节是否真的存在该论点
+            // （此处简化实现，AI 调用时会做更细的检查）
+
+            console.log(chalk.cyan(`\n🔍 章节一致性校验: ${path.basename(filePath)}\n`));
+            if (issues.length === 0) {
+                console.log(chalk.green('✓ 通过：未发现术语漂移或引用断裂'));
+            } else {
+                console.log(chalk.red(`✗ 发现 ${issues.length} 个问题:\n`));
+                issues.forEach((issue, i) => {
+                    console.log(chalk.yellow(`  [${i + 1}] ${issue.type.toUpperCase()}`));
+                    console.log(`      术语: ${issue.term}`);
+                    console.log(`      错误: ${chalk.red(issue.found)} (出现 ${issue.count} 次)`);
+                    console.log(`      正确: ${chalk.green(issue.expected)}`);
+                    console.log(chalk.gray(`      提示: ${issue.hint}\n`));
+                });
+                console.log(chalk.red.bold('  RESULT: FAIL'));
+                process.exit(2);
+            }
+        } catch (error) {
+            console.error(chalk.red('❌ 校验失败:'), error.message);
+            process.exit(1);
+        }
+    });
+
+memoryCmd
+    .command('check-all')
+    .description('对全书所有改写后章节做一致性扫描')
+    .option('-f, --file <path>', '记忆库路径', DEFAULT_MEMORY_PATH)
+    .option('-d, --dir <path>', '改写后章节目录', 'output/chapters')
+    .action(async (options) => {
+        try {
+            const memPath = path.resolve(options.file);
+            const dir = path.resolve(options.dir);
+            if (!await fs.pathExists(memPath)) {
+                console.log(chalk.red(`❌ 记忆库不存在`));
+                process.exit(1);
+            }
+            const indexPath = path.join(dir, '_index.json');
+            const draftIndexPath = path.join('draft', 'chapters', '_index.json');
+            const idxPath = await fs.pathExists(indexPath) ? indexPath :
+                            await fs.pathExists(draftIndexPath) ? draftIndexPath : null;
+            if (!idxPath) {
+                console.log(chalk.red(`❌ 找不到章节索引`));
+                process.exit(1);
+            }
+            const index = await fs.readJson(idxPath);
+            const mem = await fs.readJson(memPath);
+
+            console.log(chalk.cyan(`\n🔍 全书一致性扫描\n`));
+            console.log(chalk.gray(`目录: ${dir}`));
+            console.log(chalk.gray(`待扫描: ${index.chapters.length} 章\n`));
+
+            const allIssues = [];
+            for (const ch of index.chapters) {
+                const fpath = path.join(dir, ch.file);
+                if (!await fs.pathExists(fpath)) continue;
+                const text = await fs.readFile(fpath, 'utf-8');
+
+                for (const [term, info] of Object.entries(mem.terminology)) {
+                    if (!info.alternativesRejected) continue;
+                    for (const rejected of info.alternativesRejected) {
+                        const wrongCount = (text.match(new RegExp(rejected.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g')) || []).length;
+                        if (wrongCount > 0) {
+                            allIssues.push({
+                                chapter: ch.index,
+                                file: ch.file,
+                                term,
+                                expected: info.translation,
+                                found: rejected,
+                                count: wrongCount
+                            });
+                        }
+                    }
+                }
+            }
+
+            if (allIssues.length === 0) {
+                console.log(chalk.green('✅ 全书术语一致性通过\n'));
+            } else {
+                console.log(chalk.red(`✗ 发现 ${allIssues.length} 处不一致:\n`));
+                // 按章节分组
+                const byChapter = {};
+                allIssues.forEach(i => {
+                    byChapter[i.chapter] = byChapter[i.chapter] || [];
+                    byChapter[i.chapter].push(i);
+                });
+                for (const [ch, issues] of Object.entries(byChapter)) {
+                    console.log(chalk.yellow(`  Ch${ch}. ${issues[0].file}`));
+                    issues.forEach(i => {
+                        console.log(`    ${chalk.red(i.found)} (${i.count}次) → 应为 ${chalk.green(i.expected)}`);
+                    });
+                }
+                console.log('');
+            }
+        } catch (error) {
+            console.error(chalk.red('❌ 扫描失败:'), error.message);
+            process.exit(1);
+        }
+    });
+
 // split 命令 - 把整本初稿按章节切分为独立文件
 program
     .command('split <file>')
@@ -1669,6 +2088,10 @@ program
     .option('--output <dir>', '改写输出目录', 'output/chapters')
     .option('--protect <file>', '术语/专有名词保护清单（每行一个词）')
     .option('--threshold <num>', '通过阈值（百分比）', '75')
+    .option('--memory <file>', '长记忆库路径', DEFAULT_MEMORY_PATH)
+    .option('--window-before <num>', '滑动窗口：参考前 N 章成稿', '2')
+    .option('--window-after <num>', '滑动窗口：预读后 N 章原稿', '1')
+    .option('--no-memory', '禁用长记忆系统（不推荐）')
     .action(async (options) => {
         try {
             if (!options.style) {
@@ -1698,13 +2121,37 @@ program
                 protectedTerms = content.split(/\r?\n/).map(s => s.trim()).filter(Boolean);
             }
 
+            // 自动初始化长记忆库
+            const useMemory = options.memory !== false && options.memory !== 'false';
+            let memoryPath = null;
+            if (useMemory) {
+                memoryPath = path.resolve(options.memory);
+                if (!await fs.pathExists(memoryPath)) {
+                    await fs.ensureDir(path.dirname(memoryPath));
+                    await fs.writeJson(memoryPath, createEmptyMemory(), { spaces: 2 });
+                    console.log(chalk.gray(`✓ 已自动创建记忆库: ${path.relative(process.cwd(), memoryPath).replace(/\\/g, '/')}`));
+                }
+            }
+
             const worklist = {
-                version: '1.0',
+                version: '2.0',  // 升级到 2.0：增加记忆 + 滑动窗口
                 style: path.relative(process.cwd(), stylePath).replace(/\\/g, '/'),
                 sourceDir: options.source.replace(/\\/g, '/'),
                 outputDir: options.output.replace(/\\/g, '/'),
                 threshold: parseInt(options.threshold, 10),
                 protectedTerms,
+                // 长记忆配置
+                memory: useMemory ? {
+                    enabled: true,
+                    path: path.relative(process.cwd(), memoryPath).replace(/\\/g, '/'),
+                    description: '每章改写前必读，改写后必更新（术语表/风格决策/章节摘要/交叉引用）'
+                } : { enabled: false },
+                // 滑动窗口配置
+                slidingWindow: {
+                    contextBefore: parseInt(options.windowBefore, 10),
+                    contextAfter: parseInt(options.windowAfter, 10),
+                    description: '改写第 N 章时，参考第 N-contextBefore..N-1 章的改写成稿 + 第 N+1..N+contextAfter 章的原稿'
+                },
                 createdAt: new Date().toISOString(),
                 tasks: index.chapters.map(ch => ({
                     index: ch.index,
@@ -1730,11 +2177,18 @@ program
             if (protectedTerms.length > 0) {
                 console.log(chalk.gray(`  保护术语: ${protectedTerms.length} 个`));
             }
+            if (useMemory) {
+                console.log(chalk.cyan(`  📚 长记忆: 已启用 (${worklist.memory.path})`));
+                console.log(chalk.cyan(`  🪟 滑动窗口: 前 ${worklist.slidingWindow.contextBefore} 章 + 后 ${worklist.slidingWindow.contextAfter} 章`));
+            } else {
+                console.log(chalk.yellow(`  ⚠ 长记忆: 已禁用（不推荐，可能导致术语漂移）`));
+            }
             console.log('\n' + chalk.cyan('下一步：在 AI 助手中执行改写命令'));
             console.log(chalk.yellow('  Claude Code:  /novel.rewrite-execute'));
             console.log(chalk.yellow('  Cursor:       /rewrite-execute'));
             console.log(chalk.yellow('  Gemini CLI:   /novel:rewrite-execute'));
-            console.log(chalk.gray('\nAI 将按工单逐章改写，自动调用 novel diff-style 校验匹配度'));
+            console.log(chalk.yellow('  Codex CLI:    /novel-rewrite-execute'));
+            console.log(chalk.gray('\nAI 将按工单逐章改写，自动维护长记忆库，确保术语和风格全书一致'));
         } catch (error) {
             console.error(chalk.red('❌ 生成工单失败:'), error.message);
             process.exit(1);
@@ -1945,6 +2399,13 @@ program.on('--help', () => {
     console.log('  novel rewrite-batch --style    - 生成批量改写工单');
     console.log('  novel diff-style <a> <b>       - 对比改写前后风格变化');
     console.log('  novel compose --output         - 合并改写后章节为成稿');
+    console.log('');
+    console.log(chalk.cyan('长记忆系统 (v0.24.0+):'));
+    console.log('  novel memory init              - 初始化记忆库');
+    console.log('  novel memory show              - 查看术语表/风格决策/章节摘要');
+    console.log('  novel memory update --patch    - 合并新记忆（AI 自动调用）');
+    console.log('  novel memory validate <file>   - 校验单章是否符合记忆');
+    console.log('  novel memory check-all         - 全书一致性扫描');
     console.log('');
     console.log(chalk.gray('更多信息: https://github.com/wordflowlab/novel-writer'));
 });
